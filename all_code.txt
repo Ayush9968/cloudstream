@@ -1,0 +1,1088 @@
+package com.cloudstream.config;
+
+import com.cloudstream.handler.VideoStreamHandler;
+import org.springframework.context.annotation.Bean;
+import org.springframework.context.annotation.Configuration;
+import org.springframework.web.socket.config.annotation.EnableWebSocket;
+import org.springframework.web.socket.config.annotation.WebSocketConfigurer;
+import org.springframework.web.socket.config.annotation.WebSocketHandlerRegistry;
+import org.springframework.web.socket.server.standard.ServletServerContainerFactoryBean;
+
+/**
+ * Registers the CloudStream WebSocket endpoint and tunes the underlying
+ * Tomcat container for large binary video payloads.
+ */
+@Configuration
+@EnableWebSocket
+public class WebSocketConfig implements WebSocketConfigurer {
+
+    private final VideoStreamHandler videoStreamHandler;
+
+    public WebSocketConfig(VideoStreamHandler videoStreamHandler) {
+        this.videoStreamHandler = videoStreamHandler;
+    }
+
+    @Override
+    public void registerWebSocketHandlers(WebSocketHandlerRegistry registry) {
+        registry
+                .addHandler(videoStreamHandler, "/video-stream")
+                // The phone's browser arrives from a different origin during
+                // development (ngrok tunnel or LAN IP), so the origin check must
+                // be relaxed. LOCK THIS DOWN BEFORE ANY REAL DEPLOYMENT.
+                .setAllowedOriginPatterns("*");
+    }
+
+    /**
+     * Overrides the JSR-356 container defaults.
+     *
+     * The default binary buffer is 8192 bytes. A 2-second VP9 chunk is far
+     * larger, so without this the socket dies with status 1009 (Message Too
+     * Big) on the very first real frame.
+     */
+    @Bean
+    public ServletServerContainerFactoryBean createWebSocketContainer() {
+        ServletServerContainerFactoryBean container = new ServletServerContainerFactoryBean();
+
+        container.setMaxBinaryMessageBufferSize(2 * 1024 * 1024);   // 2 MB
+        container.setMaxTextMessageBufferSize(64 * 1024);           // control msgs only
+
+        // Mobile networks stall. Don't reap a session that is merely slow.
+        container.setMaxSessionIdleTimeout(60_000L);
+        container.setAsyncSendTimeout(10_000L);
+
+        return container;
+    }
+}
+package com.cloudstream.handler;
+
+import com.cloudstream.model.UploadContext;
+import com.cloudstream.service.DriveUploadService;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
+import org.springframework.beans.factory.annotation.Value;
+import org.springframework.stereotype.Component;
+import org.springframework.web.socket.BinaryMessage;
+import org.springframework.web.socket.CloseStatus;
+import org.springframework.web.socket.TextMessage;
+import org.springframework.web.socket.WebSocketSession;
+import org.springframework.web.socket.handler.BinaryWebSocketHandler;
+
+import java.io.ByteArrayOutputStream;
+import java.nio.ByteBuffer;
+import java.time.LocalDateTime;
+import java.time.format.DateTimeFormatter;
+import java.util.Map;
+import java.util.concurrent.ConcurrentHashMap;
+
+/**
+ * Receives the live WebM byte stream from the browser and feeds it into the
+ * Drive resumable upload session.
+ *
+ * Buffering strategy (Constraint 1):
+ *   MediaRecorder emits variable-sized blobs; Drive demands 256 KB-aligned
+ *   chunks. So every frame is appended to a per-session buffer, and we only
+ *   push when the buffer holds at least one full 256 KB block - carving off
+ *   the largest exact multiple and keeping the remainder for next time.
+ *
+ * Fail-safe (Constraint 3):
+ *   afterConnectionClosed fires for BOTH clean closes and abrupt drops, so
+ *   whatever is still in memory gets flushed there as the final chunk.
+ */
+@Component
+public class VideoStreamHandler extends BinaryWebSocketHandler {
+
+    private static final Logger log = LoggerFactory.getLogger(VideoStreamHandler.class);
+
+    private static final DateTimeFormatter STAMP =
+            DateTimeFormatter.ofPattern("yyyy-MM-dd_HH-mm-ss");
+
+    /**
+     * Live upload state keyed by WebSocketSession#getId().
+     * Concurrent because connects and disconnects land on different threads.
+     */
+    private final Map<String, UploadContext> activeUploads = new ConcurrentHashMap<>();
+
+    private final DriveUploadService driveService;
+
+    @Value("${cloudstream.upload.chunk-size:262144}")
+    private int chunkSize;
+
+    public VideoStreamHandler(DriveUploadService driveService) {
+        this.driveService = driveService;
+    }
+
+    // ---------------------------------------------------------------- connect
+
+    @Override
+    public void afterConnectionEstablished(WebSocketSession session) throws Exception {
+        log.info("Stream opened | session={} | remote={}",
+                session.getId(), session.getRemoteAddress());
+
+        String fileName = "CloudStream_" + LocalDateTime.now().format(STAMP) + ".webm";
+        UploadContext ctx = new UploadContext(fileName);
+
+        try {
+            ctx.setUploadUrl(driveService.initiateSession(fileName));
+            activeUploads.put(session.getId(), ctx);
+
+            // Tell the client it is safe to start recording. Without this the
+            // first blobs could arrive before the Drive session exists.
+            session.sendMessage(new TextMessage("READY:" + fileName));
+
+        } catch (Exception e) {
+            log.error("Could not open Drive session - closing socket.", e);
+            session.close(CloseStatus.SERVER_ERROR.withReason("Drive init failed"));
+        }
+    }
+
+    // ------------------------------------------------------------- data frame
+
+    @Override
+    protected void handleBinaryMessage(WebSocketSession session, BinaryMessage message) {
+        UploadContext ctx = activeUploads.get(session.getId());
+        if (ctx == null) {
+            log.warn("Binary frame for unknown session {} - ignoring.", session.getId());
+            return;
+        }
+
+        ByteBuffer payload = message.getPayload();
+        byte[] incoming = new byte[payload.remaining()];
+        payload.get(incoming);
+
+        // Serialise per session: frames arrive on container threads and the
+        // buffer is not thread-safe.
+        synchronized (ctx) {
+            if (ctx.isFinalised()) {
+                return;     // late frame after close - drop it
+            }
+
+            ByteBuffer.class.getName();          // (no-op, keeps imports honest)
+            ctx.getBuffer().write(incoming, 0, incoming.length);
+
+            log.debug("Frame received | session={} | +{} B | buffered={} KB",
+                    session.getId(), incoming.length, ctx.getBuffer().size() / 1024);
+
+            if (ctx.getBuffer().size() >= chunkSize) {
+                flushAlignedBlocks(ctx);
+            }
+        }
+    }
+
+    /**
+     * Carves the largest exact multiple of 256 KB out of the buffer, uploads
+     * it, and retains the remainder. Sending a non-aligned chunk before the
+     * final one makes Drive reject the entire session.
+     */
+    private void flushAlignedBlocks(UploadContext ctx) {
+        byte[] buffered = ctx.getBuffer().toByteArray();
+
+        int sendable = (buffered.length / chunkSize) * chunkSize;
+        if (sendable == 0) {
+            return;
+        }
+
+        byte[] aligned = new byte[sendable];
+        System.arraycopy(buffered, 0, aligned, 0, sendable);
+
+        try {
+            driveService.uploadChunk(ctx.getUploadUrl(), aligned, ctx.getBytesUploaded());
+            ctx.addBytesUploaded(sendable);
+
+            // Reset and put back only the leftover tail.
+            ctx.getBuffer().reset();
+            ctx.getBuffer().write(buffered, sendable, buffered.length - sendable);
+
+        } catch (Exception e) {
+            // Keep the bytes in the buffer; the final flush may still save them.
+            log.error("Chunk upload failed at offset {} - retaining buffer.",
+                    ctx.getBytesUploaded(), e);
+        }
+    }
+
+    // ------------------------------------------------------------- disconnect
+
+    /**
+     * THE FAIL-SAFE. Fires on a clean close and on an abrupt drop alike -
+     * phone dies, tab killed, Wi-Fi lost. Whatever is still in memory must
+     * reach Drive here or the recording is truncated.
+     */
+    @Override
+    public void afterConnectionClosed(WebSocketSession session, CloseStatus status) {
+        // remove() makes the flush idempotent: whichever of the close/error
+        // paths runs second finds nothing and does nothing.
+        UploadContext ctx = activeUploads.remove(session.getId());
+        if (ctx == null) {
+            return;
+        }
+
+        log.info("Stream closed | session={} | code={} | reason={}",
+                session.getId(), status.getCode(), status.getReason());
+
+        synchronized (ctx) {
+            if (ctx.isFinalised()) {
+                return;
+            }
+            ctx.markFinalised();
+
+            try {
+                // Nothing ever arrived - cancel rather than leave an empty file.
+                if (ctx.projectedTotalSize() == 0) {
+                    driveService.abortSession(ctx.getUploadUrl());
+                    return;
+                }
+
+                // Push any remaining aligned blocks first...
+                if (ctx.getBuffer().size() >= chunkSize) {
+                    flushAlignedBlocks(ctx);
+                }
+
+                // ...then send the residual tail as the final chunk. This one
+                // is exempt from the 256 KB rule and carries the real total,
+                // which is what makes the file playable.
+                ByteArrayOutputStream remaining = ctx.getBuffer();
+                String fileId = driveService.finaliseUpload(
+                        ctx.getUploadUrl(),
+                        remaining.toByteArray(),
+                        ctx.getBytesUploaded());
+
+                log.info("Recording '{}' saved | fileId={}", ctx.getFileName(), fileId);
+
+            } catch (Exception e) {
+                log.error("Finalisation failed for session {} - file may be " +
+                        "incomplete on Drive.", session.getId(), e);
+            }
+        }
+    }
+
+    /**
+     * Transport-level failure. Spring calls afterConnectionClosed right after,
+     * so we only log here and let the single flush path above do the work.
+     */
+    @Override
+    public void handleTransportError(WebSocketSession session, Throwable exception) {
+        log.error("Transport error | session={}", session.getId(), exception);
+    }
+}
+package com.cloudstream.model;
+
+import lombok.Setter;
+
+import java.io.ByteArrayOutputStream;
+
+/**
+ * Per-connection upload state.
+ * Spring creates exactly ONE handler instance shared across every client, so
+ * none of this can live in handler fields. One UploadContext exists per
+ * WebSocket session, held in a ConcurrentHashMap keyed by session ID.
+ */
+public class UploadContext {
+
+    /** Name the recording will carry in Drive. */
+    private final String fileName;
+
+    /** Resumable session URL returned by Drive's initiation call. */
+    private String uploadUrl;
+
+    /** Bytes received but not yet aligned to a 256 KB boundary. */
+    private final ByteArrayOutputStream buffer = new ByteArrayOutputStream();
+
+    /** Running count of bytes already committed. Drives the Content-Range header. */
+    private long bytesUploaded = 0L;
+
+    /**
+     * Guards against a double flush. Both handleTransportError and
+     * afterConnectionClosed fire on an abrupt drop; finalising twice
+     * would corrupt the file.
+     */
+    private boolean finalised = false;
+
+    public UploadContext(String fileName) {
+        this.fileName = fileName;
+    }
+
+    public String getFileName() {
+        return fileName;
+    }
+
+    public String getUploadUrl() {
+        return uploadUrl;
+    }
+
+    public void setUploadUrl(String uploadUrl) {
+        this.uploadUrl = uploadUrl;
+    }
+
+    public ByteArrayOutputStream getBuffer() {
+        return buffer;
+    }
+
+    public long getBytesUploaded() {
+        return bytesUploaded;
+    }
+
+    public void addBytesUploaded(long count) {
+        this.bytesUploaded += count;
+    }
+
+    public boolean isFinalised() {
+        return finalised;
+    }
+
+    public void markFinalised() {
+        this.finalised = true;
+    }
+
+    /** Total size the file will have once the residual buffer is flushed. */
+    public long projectedTotalSize() {
+        return bytesUploaded + buffer.size();
+    }
+}
+package com.cloudstream.service;
+
+import com.google.auth.oauth2.GoogleCredentials;
+import jakarta.annotation.PostConstruct;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
+import org.springframework.beans.factory.annotation.Value;
+import org.springframework.core.io.Resource;
+import org.springframework.stereotype.Service;
+
+import java.io.IOException;
+import java.io.InputStream;
+import java.util.List;
+
+/**
+ * Turns the service-account JSON key into a short-lived OAuth2 access token.
+ * GoogleCredentials handles the RS256 JWT assertion and the token exchange
+ * internally. We simply ask it for a valid token before each Drive call;
+ * refreshIfExpired() is a no-op when the cached token is still good.
+ */
+@Service
+public class DriveAuthService {
+
+    private static final Logger log = LoggerFactory.getLogger(DriveAuthService.class);
+
+    /**
+     * drive.file restricts us to files this application itself created.
+     * That is the correct least-privilege scope here - we never need to read
+     * the user's existing Drive contents.
+     */
+    private static final List<String> SCOPES =
+            List.of("https://www.googleapis.com/auth/drive.file");
+
+    @Value("${google.drive.credentials-path}")
+    private Resource credentialsResource;
+
+    private GoogleCredentials credentials;
+
+    /**
+     * Loads the key once at startup. Failing here at boot is deliberate:
+     * far better than discovering a bad key midway through a live recording.
+     */
+    @PostConstruct
+    public void init() throws IOException {
+        if (!credentialsResource.exists()) {
+            throw new IllegalStateException(
+                    "Service-account key not found at " + credentialsResource +
+                            ". Place your JSON key in src/main/resources/credentials/.");
+        }
+
+        try (InputStream in = credentialsResource.getInputStream()) {
+            this.credentials = GoogleCredentials.fromStream(in).createScoped(SCOPES);
+        }
+
+        // Fail fast if the key is malformed or the clock is badly skewed.
+        this.credentials.refreshIfExpired();
+
+        log.info("Google service-account credentials loaded and verified.");
+    }
+
+    /**
+     * @return a currently-valid bearer token for the Authorization header.
+     */
+    public synchronized String getAccessToken() throws IOException {
+        credentials.refreshIfExpired();
+        return credentials.getAccessToken().getTokenValue();
+    }
+}
+package com.cloudstream.service;
+
+import com.fasterxml.jackson.databind.JsonNode;
+import com.fasterxml.jackson.databind.ObjectMapper;
+import com.fasterxml.jackson.databind.node.ObjectNode;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
+import org.springframework.beans.factory.annotation.Value;
+import org.springframework.stereotype.Service;
+
+import java.io.IOException;
+import java.net.URI;
+import java.net.http.HttpClient;
+import java.net.http.HttpRequest;
+import java.net.http.HttpResponse;
+import java.time.Duration;
+import java.util.List;
+
+/**
+ * Drives the Google Drive v3 resumable upload protocol over raw HTTP.
+ *
+ * The protocol in three acts:
+ *
+ *   1. INITIATE  POST .../files?uploadType=resumable
+ *                Body = JSON metadata. Response carries a 'Location' header
+ *                which is the session URL. Everything after this is a PUT
+ *                to that URL.
+ *
+ *   2. STREAM    PUT <sessionUrl>
+ *                Content-Range: bytes <start>-<end>/*
+ *                The '*' means "total size unknown - more is coming".
+ *                Drive replies 308 (Resume Incomplete). Every chunk sent this
+ *                way MUST be an exact multiple of 256 KB.
+ *
+ *   3. FINALISE  PUT <sessionUrl>
+ *                Content-Range: bytes <start>-<end>/<total>
+ *                A real total instead of '*' tells Drive the file is complete.
+ *                This final chunk is EXEMPT from the 256 KB rule.
+ *                Drive replies 200/201 with the file metadata.
+ */
+@Service
+public class DriveUploadService {
+
+    private static final Logger log = LoggerFactory.getLogger(DriveUploadService.class);
+
+    private static final String INITIATE_URL =
+            "https://www.googleapis.com/upload/drive/v3/files?uploadType=resumable";
+    private static final String FILES_URL =
+            "https://www.googleapis.com/drive/v3/files";
+
+    private static final String MIME_TYPE = "video/webm";
+
+    private final DriveAuthService authService;
+    private final ObjectMapper mapper = new ObjectMapper();
+
+    /**
+     * followRedirects(NEVER) is essential. Drive signals "chunk accepted,
+     * keep going" with HTTP 308, which is officially Permanent Redirect.
+     * An auto-following client would chase it and break the upload.
+     */
+    private final HttpClient http = HttpClient.newBuilder()
+            .followRedirects(HttpClient.Redirect.NEVER)
+            .connectTimeout(Duration.ofSeconds(20))
+            .build();
+
+    @Value("${google.drive.target-folder-id}")
+    private String targetFolderId;
+
+    @Value("${google.drive.make-public:false}")
+    private boolean makePublic;
+
+    public DriveUploadService(DriveAuthService authService) {
+        this.authService = authService;
+    }
+
+    // ------------------------------------------------------------ 1. INITIATE
+
+    /**
+     * Opens a resumable session and returns its URL.
+     *
+     * Note X-Upload-Content-Type but deliberately NO X-Upload-Content-Length:
+     * omitting the length is precisely how you declare "unknown size".
+     */
+    public String initiateSession(String fileName) throws IOException, InterruptedException {
+
+        ObjectNode metadata = mapper.createObjectNode();
+        metadata.put("name", fileName);
+        metadata.put("mimeType", MIME_TYPE);
+        if (targetFolderId != null && !targetFolderId.isBlank()
+                && !targetFolderId.startsWith("PASTE_")) {
+            metadata.putArray("parents").add(targetFolderId);
+        }
+
+        HttpRequest request = HttpRequest.newBuilder()
+                .uri(URI.create(INITIATE_URL))
+                .header("Authorization", "Bearer " + authService.getAccessToken())
+                .header("Content-Type", "application/json; charset=UTF-8")
+                .header("X-Upload-Content-Type", MIME_TYPE)
+                .POST(HttpRequest.BodyPublishers.ofString(metadata.toString()))
+                .build();
+
+        HttpResponse<String> response =
+                http.send(request, HttpResponse.BodyHandlers.ofString());
+
+        if (response.statusCode() != 200) {
+            throw new IOException("Drive session initiation failed: HTTP "
+                    + response.statusCode() + " - " + response.body());
+        }
+
+        String sessionUrl = response.headers()
+                .firstValue("Location")
+                .orElseThrow(() -> new IOException(
+                        "Drive returned 200 but no Location header."));
+
+        log.info("Resumable session opened for '{}'", fileName);
+        return sessionUrl;
+    }
+
+    // -------------------------------------------------------------- 2. STREAM
+
+    /**
+     * Pushes one 256 KB-aligned chunk. The caller guarantees alignment.
+     *
+     * @param offset bytes already committed; this chunk starts here
+     */
+    public void uploadChunk(String sessionUrl, byte[] chunk, long offset)
+            throws IOException, InterruptedException {
+
+        long start = offset;
+        long end = offset + chunk.length - 1;
+
+        HttpRequest request = HttpRequest.newBuilder()
+                .uri(URI.create(sessionUrl))
+                .header("Content-Range", "bytes " + start + "-" + end + "/*")
+                .timeout(Duration.ofSeconds(60))
+                .PUT(HttpRequest.BodyPublishers.ofByteArray(chunk))
+                .build();
+
+        HttpResponse<String> response =
+                http.send(request, HttpResponse.BodyHandlers.ofString());
+
+        // 308 = "Resume Incomplete" = chunk stored, send the next one.
+        // A 200/201 here would mean Drive thinks we're finished - a bug.
+        if (response.statusCode() != 308) {
+            throw new IOException("Chunk upload failed at offset " + offset
+                    + ": HTTP " + response.statusCode() + " - " + response.body());
+        }
+
+        log.debug("Chunk committed | bytes {}-{} | size={} KB",
+                start, end, chunk.length / 1024);
+    }
+
+    // ------------------------------------------------------------ 3. FINALISE
+
+    /**
+     * Sends the last chunk (any size, including zero) with a real total,
+     * converting the open session into a closed, playable Drive file.
+     *
+     * @param finalChunk residual bytes; may be empty
+     * @param offset     bytes already committed
+     * @return the Drive file ID
+     */
+    public String finaliseUpload(String sessionUrl, byte[] finalChunk, long offset)
+            throws IOException, InterruptedException {
+
+        long total = offset + finalChunk.length;
+
+        HttpRequest.Builder builder = HttpRequest.newBuilder()
+                .uri(URI.create(sessionUrl))
+                .timeout(Duration.ofSeconds(60));
+
+        if (finalChunk.length == 0) {
+            // Nothing left to send, but the session still needs closing.
+            // 'bytes */<total>' with an empty body is the documented way
+            // to finalise without contributing further data.
+            builder.header("Content-Range", "bytes */" + total)
+                    .PUT(HttpRequest.BodyPublishers.noBody());
+        } else {
+            long start = offset;
+            long end = total - 1;
+            builder.header("Content-Range", "bytes " + start + "-" + end + "/" + total)
+                    .PUT(HttpRequest.BodyPublishers.ofByteArray(finalChunk));
+        }
+
+        HttpResponse<String> response =
+                http.send(builder.build(), HttpResponse.BodyHandlers.ofString());
+
+        if (response.statusCode() != 200 && response.statusCode() != 201) {
+            throw new IOException("Finalisation failed: HTTP "
+                    + response.statusCode() + " - " + response.body());
+        }
+
+        JsonNode body = mapper.readTree(response.body());
+        String fileId = body.path("id").asText();
+
+        log.info("Upload finalised | fileId={} | totalBytes={} ({} MB)",
+                fileId, total, total / (1024 * 1024));
+
+        if (makePublic) {
+            grantLinkAccess(fileId);
+        }
+        return fileId;
+    }
+
+    // --------------------------------------------------------------- cleanup
+
+    /**
+     * Cancels a session that produced no data, so we don't leave a zero-byte
+     * file in Drive when a client connects and immediately disconnects.
+     */
+    public void abortSession(String sessionUrl) {
+        try {
+            HttpRequest request = HttpRequest.newBuilder()
+                    .uri(URI.create(sessionUrl))
+                    .DELETE()
+                    .build();
+            http.send(request, HttpResponse.BodyHandlers.discarding());
+            log.info("Empty session aborted.");
+        } catch (Exception e) {
+            // Abandoned sessions expire on Google's side within a week anyway.
+            log.warn("Could not abort session cleanly: {}", e.getMessage());
+        }
+    }
+
+    /**
+     * Adds an "anyone with the link can view" permission. Convenience for
+     * demos only - it is not part of the upload protocol.
+     */
+    private void grantLinkAccess(String fileId) {
+        try {
+            ObjectNode permission = mapper.createObjectNode();
+            permission.put("role", "reader");
+            permission.put("type", "anyone");
+
+            HttpRequest request = HttpRequest.newBuilder()
+                    .uri(URI.create(FILES_URL + "/" + fileId + "/permissions"))
+                    .header("Authorization", "Bearer " + authService.getAccessToken())
+                    .header("Content-Type", "application/json")
+                    .POST(HttpRequest.BodyPublishers.ofString(permission.toString()))
+                    .build();
+
+            http.send(request, HttpResponse.BodyHandlers.discarding());
+            log.info("Shareable link: https://drive.google.com/file/d/{}/view", fileId);
+        } catch (Exception e) {
+            log.warn("Could not set public permission: {}", e.getMessage());
+        }
+    }
+}
+package com.cloudstream;
+
+import org.springframework.boot.SpringApplication;
+import org.springframework.boot.autoconfigure.SpringBootApplication;
+
+/**
+ * CloudStream entry point.
+ * Note that we do NOT annotate with @EnableWebSocket here - that lives on
+ * WebSocketConfig, keeping socket concerns in one place.
+ */
+@SpringBootApplication
+public class CloudStreamApplication {
+
+    public static void main(String[] args) {
+        SpringApplication.run(CloudStreamApplication.class, args);
+    }
+}
+/**
+ * CloudStream frontend recorder.
+ *
+ * Captures the camera with MediaRecorder, which emits a Blob every
+ * TIMESLICE ms, and forwards each Blob down a WebSocket as a binary frame.
+ *
+ * Why the stream survives a crash: MediaRecorder puts the WebM header
+ * (EBML + Segment + Tracks) in the FIRST blob only; every later blob is a
+ * self-contained Cluster. So the concatenation of blobs 1.N is a valid
+ * WebM file for any N - which is exactly what makes a truncated upload
+ * still playable.
+ */
+
+const TIMESLICE_MS = 2000;   // matches the 2-second chunk requirement
+
+const preview    = document.getElementById('preview');
+const startBtn   = document.getElementById('startBtn');
+const stopBtn    = document.getElementById('stopBtn');
+const statusEl   = document.getElementById('status');
+const chunkCount = document.getElementById('chunkCount');
+const byteCount  = document.getElementById('byteCount');
+
+let socket   = null;
+let recorder = null;
+let stream   = null;
+let chunks   = 0;
+let bytes    = 0;
+
+function log(message) {
+    statusEl.textContent = message;
+    console.log('[CloudStream]', message);
+}
+
+/** Picks the best codec this browser actually supports. */
+function pickMimeType() {
+    const candidates = [
+        'video/webm; codecs=vp9,opus',
+        'video/webm; codecs=vp8,opus',
+        'video/webm'
+    ];
+    for (const type of candidates) {
+        if (MediaRecorder.isTypeSupported(type)) return type;
+    }
+    return '';   // let the browser decide
+}
+
+/** Builds ws:// or wss:// to match the page's own protocol. */
+function socketUrl() {
+    const scheme = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
+    return `${scheme}//${window.location.host}/video-stream`;
+}
+
+startBtn.addEventListener('click', async () => {
+    startBtn.disabled = true;
+
+    try {
+        // getUserMedia requires a SECURE CONTEXT. localhost counts; a plain
+        // http:// LAN address does not. Use ngrok or similar on a real phone.
+        stream = await navigator.mediaDevices.getUserMedia({
+            video: { facingMode: 'environment', width: { ideal: 1280 } },
+            audio: true
+        });
+        preview.srcObject = stream;
+    } catch (err) {
+        log('Camera access denied or unavailable: ' + err.message);
+        startBtn.disabled = false;
+        return;
+    }
+
+    log('Connecting to server...');
+    socket = new WebSocket(socketUrl());
+    socket.binaryType = 'arraybuffer';
+
+    socket.onopen = () => log('Connected. Waiting for Drive session...');
+
+    socket.onmessage = (event) => {
+        // Server sends READY:<filename> once the Drive session is live.
+        if (typeof event.data === 'string' && event.data.startsWith('READY:')) {
+            beginRecording(event.data.substring(6));
+        }
+    };
+
+    socket.onerror = () => log('WebSocket error - is the server running?');
+
+    socket.onclose = (event) => {
+        log(`Connection closed (code ${event.code}). ` +
+            `Server has flushed ${bytes} bytes to Drive.`);
+        cleanUp();
+    };
+});
+
+function beginRecording(fileName) {
+    const mimeType = pickMimeType();
+    recorder = new MediaRecorder(stream, {
+        mimeType: mimeType,
+        videoBitsPerSecond: 2_500_000
+    });
+
+    recorder.ondataavailable = (event) => {
+        if (event.data.size === 0) return;
+        if (!socket || socket.readyState !== WebSocket.OPEN) return;
+
+        // Back-pressure guard: if the socket is already congested, skipping
+        // would corrupt the stream, so we only warn.
+        if (socket.bufferedAmount > 8 * 1024 * 1024) {
+            console.warn('Socket congested:', socket.bufferedAmount, 'bytes queued');
+        }
+
+        socket.send(event.data);
+
+        chunks += 1;
+        bytes  += event.data.size;
+        chunkCount.textContent = chunks;
+        byteCount.textContent  = (bytes / 1024).toFixed(0) + ' KB';
+    };
+
+    // The timeslice argument is what makes this a live stream rather than
+    // one big blob at the end.
+    recorder.start(TIMESLICE_MS);
+
+    stopBtn.disabled = false;
+    log(`Recording to "${fileName}" (${mimeType}). Sending every ${TIMESLICE_MS / 1000}s.`);
+}
+
+stopBtn.addEventListener('click', () => {
+    stopBtn.disabled = true;
+    log('Stopping...');
+
+    if (recorder && recorder.state !== 'inactive') {
+        // Fires one last ondataavailable, then we close so the server's
+        // afterConnectionClosed can finalise the Drive upload.
+        recorder.onstop = () => {
+            setTimeout(() => socket && socket.close(1000, 'User stopped'), 300);
+        };
+        recorder.stop();
+    } else if (socket) {
+        socket.close(1000, 'User stopped');
+    }
+});
+
+function cleanUp() {
+    if (stream) {
+        stream.getTracks().forEach(track => track.stop());
+        stream = null;
+    }
+    startBtn.disabled = false;
+    stopBtn.disabled  = true;
+}
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>CloudStream Recorder</title>
+    <style>
+        :root { color-scheme: dark; }
+        body {
+            margin: 0; padding: 1.5rem;
+            font-family: system-ui, -apple-system, sans-serif;
+            background: #111; color: #eee;
+            display: flex; flex-direction: column; gap: 1rem;
+            align-items: center;
+        }
+        h1 { font-size: 1.25rem; margin: 0; font-weight: 600; }
+        video {
+            width: 100%; max-width: 480px; border-radius: 12px;
+            background: #000; aspect-ratio: 9/16; object-fit: cover;
+        }
+        .controls { display: flex; gap: 0.75rem; }
+        button {
+            padding: 0.85rem 1.75rem; font-size: 1rem; font-weight: 600;
+            border: none; border-radius: 10px; cursor: pointer;
+        }
+        #startBtn { background: #2d7d46; color: #fff; }
+        #stopBtn  { background: #a32b2b; color: #fff; }
+        button:disabled { opacity: 0.4; cursor: not-allowed; }
+        #status {
+            font-family: ui-monospace, monospace; font-size: 0.8rem;
+            background: #1c1c1c; padding: 0.75rem 1rem; border-radius: 8px;
+            width: 100%; max-width: 480px; box-sizing: border-box;
+            min-height: 3rem; line-height: 1.5;
+        }
+        .stats { display: flex; gap: 1.5rem; font-size: 0.85rem; color: #999; }
+        .stats b { color: #eee; font-variant-numeric: tabular-nums; }
+    </style>
+</head>
+<body>
+
+<h1>CloudStream — Live Recorder</h1>
+
+<!-- muted + playsinline are required for autoplay preview on iOS/Android -->
+<video id="preview" autoplay muted playsinline></video>
+
+<div class="controls">
+    <button id="startBtn">Start Recording</button>
+    <button id="stopBtn" disabled>Stop</button>
+</div>
+
+<div class="stats">
+    <span>Chunks sent: <b id="chunkCount">0</b></span>
+    <span>Uploaded: <b id="byteCount">0 KB</b></span>
+</div>
+
+<div id="status">Idle.</div>
+
+<script src="/js/recorder.js"></script>
+</body>
+</html>
+/**
+ * CloudStream frontend recorder.
+ *
+ * Captures the camera with MediaRecorder, which emits a Blob every
+ * TIMESLICE ms, and forwards each Blob down a WebSocket as a binary frame.
+ *
+ * Why the stream survives a crash: MediaRecorder puts the WebM header
+ * (EBML + Segment + Tracks) in the FIRST blob only; every later blob is a
+ * self-contained Cluster. So the concatenation of blobs 1.N is a valid
+ * WebM file for any N - which is exactly what makes a truncated upload
+ * still playable.
+ */
+
+const TIMESLICE_MS = 2000;   // matches the 2-second chunk requirement
+
+const preview    = document.getElementById('preview');
+const startBtn   = document.getElementById('startBtn');
+const stopBtn    = document.getElementById('stopBtn');
+const statusEl   = document.getElementById('status');
+const chunkCount = document.getElementById('chunkCount');
+const byteCount  = document.getElementById('byteCount');
+
+let socket   = null;
+let recorder = null;
+let stream   = null;
+let chunks   = 0;
+let bytes    = 0;
+
+function log(message) {
+    statusEl.textContent = message;
+    console.log('[CloudStream]', message);
+}
+
+/** Picks the best codec this browser actually supports. */
+function pickMimeType() {
+    const candidates = [
+        'video/webm; codecs=vp9,opus',
+        'video/webm; codecs=vp8,opus',
+        'video/webm'
+    ];
+    for (const type of candidates) {
+        if (MediaRecorder.isTypeSupported(type)) return type;
+    }
+    return '';   // let the browser decide
+}
+
+/** Builds ws:// or wss:// to match the page's own protocol. */
+function socketUrl() {
+    const scheme = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
+    return `${scheme}//${window.location.host}/video-stream`;
+}
+
+startBtn.addEventListener('click', async () => {
+    startBtn.disabled = true;
+
+    try {
+        // getUserMedia requires a SECURE CONTEXT. localhost counts; a plain
+        // http:// LAN address does not. Use ngrok or similar on a real phone.
+        stream = await navigator.mediaDevices.getUserMedia({
+            video: { facingMode: 'environment', width: { ideal: 1280 } },
+            audio: true
+        });
+        preview.srcObject = stream;
+    } catch (err) {
+        log('Camera access denied or unavailable: ' + err.message);
+        startBtn.disabled = false;
+        return;
+    }
+
+    log('Connecting to server...');
+    socket = new WebSocket(socketUrl());
+    socket.binaryType = 'arraybuffer';
+
+    socket.onopen = () => log('Connected. Waiting for Drive session...');
+
+    socket.onmessage = (event) => {
+        // Server sends READY:<filename> once the Drive session is live.
+        if (typeof event.data === 'string' && event.data.startsWith('READY:')) {
+            beginRecording(event.data.substring(6));
+        }
+    };
+
+    socket.onerror = () => log('WebSocket error - is the server running?');
+
+    socket.onclose = (event) => {
+        log(`Connection closed (code ${event.code}). ` +
+            `Server has flushed ${bytes} bytes to Drive.`);
+        cleanUp();
+    };
+});
+
+function beginRecording(fileName) {
+    const mimeType = pickMimeType();
+    recorder = new MediaRecorder(stream, {
+        mimeType: mimeType,
+        videoBitsPerSecond: 2_500_000
+    });
+
+    recorder.ondataavailable = (event) => {
+        if (event.data.size === 0) return;
+        if (!socket || socket.readyState !== WebSocket.OPEN) return;
+
+        // Back-pressure guard: if the socket is already congested, skipping
+        // would corrupt the stream, so we only warn.
+        if (socket.bufferedAmount > 8 * 1024 * 1024) {
+            console.warn('Socket congested:', socket.bufferedAmount, 'bytes queued');
+        }
+
+        socket.send(event.data);
+
+        chunks += 1;
+        bytes  += event.data.size;
+        chunkCount.textContent = chunks;
+        byteCount.textContent  = (bytes / 1024).toFixed(0) + ' KB';
+    };
+
+    // The timeslice argument is what makes this a live stream rather than
+    // one big blob at the end.
+    recorder.start(TIMESLICE_MS);
+
+    stopBtn.disabled = false;
+    log(`Recording to "${fileName}" (${mimeType}). Sending every ${TIMESLICE_MS / 1000}s.`);
+}
+
+stopBtn.addEventListener('click', () => {
+    stopBtn.disabled = true;
+    log('Stopping...');
+
+    if (recorder && recorder.state !== 'inactive') {
+        // Fires one last ondataavailable, then we close so the server's
+        // afterConnectionClosed can finalise the Drive upload.
+        recorder.onstop = () => {
+            setTimeout(() => socket && socket.close(1000, 'User stopped'), 300);
+        };
+        recorder.stop();
+    } else if (socket) {
+        socket.close(1000, 'User stopped');
+    }
+});
+
+function cleanUp() {
+    if (stream) {
+        stream.getTracks().forEach(track => track.stop());
+        stream = null;
+    }
+    startBtn.disabled = false;
+    stopBtn.disabled  = true;
+}
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>CloudStream Recorder</title>
+    <style>
+        :root { color-scheme: dark; }
+        body {
+            margin: 0; padding: 1.5rem;
+            font-family: system-ui, -apple-system, sans-serif;
+            background: #111; color: #eee;
+            display: flex; flex-direction: column; gap: 1rem;
+            align-items: center;
+        }
+        h1 { font-size: 1.25rem; margin: 0; font-weight: 600; }
+        video {
+            width: 100%; max-width: 480px; border-radius: 12px;
+            background: #000; aspect-ratio: 9/16; object-fit: cover;
+        }
+        .controls { display: flex; gap: 0.75rem; }
+        button {
+            padding: 0.85rem 1.75rem; font-size: 1rem; font-weight: 600;
+            border: none; border-radius: 10px; cursor: pointer;
+        }
+        #startBtn { background: #2d7d46; color: #fff; }
+        #stopBtn  { background: #a32b2b; color: #fff; }
+        button:disabled { opacity: 0.4; cursor: not-allowed; }
+        #status {
+            font-family: ui-monospace, monospace; font-size: 0.8rem;
+            background: #1c1c1c; padding: 0.75rem 1rem; border-radius: 8px;
+            width: 100%; max-width: 480px; box-sizing: border-box;
+            min-height: 3rem; line-height: 1.5;
+        }
+        .stats { display: flex; gap: 1.5rem; font-size: 0.85rem; color: #999; }
+        .stats b { color: #eee; font-variant-numeric: tabular-nums; }
+    </style>
+</head>
+<body>
+
+<h1>CloudStream — Live Recorder</h1>
+
+<!-- muted + playsinline are required for autoplay preview on iOS/Android -->
+<video id="preview" autoplay muted playsinline></video>
+
+<div class="controls">
+    <button id="startBtn">Start Recording</button>
+    <button id="stopBtn" disabled>Stop</button>
+</div>
+
+<div class="stats">
+    <span>Chunks sent: <b id="chunkCount">0</b></span>
+    <span>Uploaded: <b id="byteCount">0 KB</b></span>
+</div>
+
+<div id="status">Idle.</div>
+
+<script src="/js/recorder.js"></script>
+</body>
+</html>
